@@ -1,0 +1,81 @@
+# ========================================
+# DevOpsMind AI - Git Ignore
+# ========================================
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+
+# Testing and code coverage
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Environment variables and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+secrets.json
+
+# Local databases
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite3-journal
+
+# Logs
+logs/
+*.log
+
+# Generated data and temporary files
+data/sandbox_tests/
+data/tmp/
+data/temp/
+*.bak
+*.bom-backup
+*.tmp
+*.temp
+*.zip
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# IDE settings
+.vscode/
+.idea/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local tooling
+.streamlit/secrets.toml
+
+# Local security testing fixtures
+src/devopsmind/test_sample.py
+
+# Keep project documentation, source code,
+# requirements and legitimate tests.

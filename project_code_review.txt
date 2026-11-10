@@ -1,0 +1,869 @@
+﻿DEVOPSMIND AI - SOURCE CODE REVIEW
+
+
+======================================================================
+FILE: requirements.txt
+======================================================================
+# Configuration & Core
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+python-dotenv>=1.0.0
+
+# Database & Data Processing
+sqlite3-api
+pandas>=2.0.0
+
+# LLM & Agent Framework
+langchain>=0.1.0
+langchain-community>=0.0.20
+langchain-ollama>=0.0.1
+langgraph>=0.0.26
+
+# Code Analysis & Static Tool Interfaces
+ruff>=0.2.0
+bandit>=1.7.0
+pytest>=8.0.0
+
+# Dashboard & Visuals
+streamlit>=1.31.0
+pyvis>=0.3.1
+plotly>=5.18.0
+
+pathspec>=0.11.0
+
+
+======================================================================
+FILE: src/devopsmind/config.py
+======================================================================
+from pathlib import Path
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    PROJECT_NAME: str = "DevOpsMind AI"
+    BASE_DIR: Path = Path(__file__).resolve().parent.parent.parent
+    DATA_DIR: Path = BASE_DIR / "data"
+    DB_PATH: Path = DATA_DIR / "devopsmind.db"
+    
+    # Ollama Settings
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = "llama3.2:latest"  # or "codellama" / "llama3"
+    
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+
+
+======================================================================
+FILE: src/devopsmind/main.py
+======================================================================
+import uuid
+import sqlite3
+from datetime import datetime
+from src.devopsmind.config import settings
+from src.devopsmind.database.sqlite import init_db
+from src.devopsmind.agents.code_review_agent import CodeReviewAgent
+from src.devopsmind.agents.security_agent import SecurityAgent
+from src.devopsmind.agents.architecture_agent import ArchitectureAgent
+from src.devopsmind.agents.test_gen_agent import TestGenerationAgent
+from src.devopsmind.agents.log_agent import LogAnalysisAgent
+
+def run_phase4_test():
+    print(f"=== {settings.PROJECT_NAME} â€” Phase 4: Log Analysis Agent ===")
+    init_db()
+
+    run_id = str(uuid.uuid4())
+    log_agent = LogAnalysisAgent(run_id=run_id)
+
+    # Path to sample build error log
+    log_file = str(settings.BASE_DIR / "logs" / "build_error.log")
+
+    # Run Log Analysis
+    log_findings = log_agent.analyze(log_file)
+
+    # Save findings to SQLite
+    conn = sqlite3.connect(settings.DB_PATH)
+    cursor = conn.cursor()
+
+    cursor.execute(
+        "INSERT INTO analysis_runs VALUES (?, ?, ?, ?, ?)",
+        (run_id, "DevOpsMind-Phase4-Logs", datetime.now().isoformat(), 85, "COMPLETED")
+    )
+
+    for f in log_findings:
+        cursor.execute(
+            """INSERT INTO agent_findings 
+               (finding_id, run_id, agent_name, severity, file_path, line_number, title, description, recommended_fix, timestamp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (f.id, f.run_id, f.agent_name, f.severity, f.file_path, f.line_number, f.title, f.description, f.recommended_fix, f.timestamp)
+        )
+
+    conn.commit()
+
+    cursor.execute("SELECT agent_name, severity, title, description FROM agent_findings WHERE run_id = ?", (run_id,))
+    db_records = cursor.fetchall()
+    conn.close()
+
+    print(f"\n--- Phase 4 Log Analysis Summary ---")
+    for rec in db_records:
+        print(f"[{rec[0]}] [{rec[1]}] {rec[2]}\nDiagnosis: {rec[3]}\n")
+
+    print("\n=== Phase 4 Log Analysis Agent Completed Successfully! ===")
+
+if __name__ == "__main__":
+    run_phase4_test()
+
+
+======================================================================
+FILE: src/devopsmind/schemas/findings.py
+======================================================================
+from pydantic import BaseModel, Field
+from typing import Optional, Literal
+from datetime import datetime
+
+class Finding(BaseModel):
+    id: str
+    run_id: str
+    agent_name: str
+    severity: Literal["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]
+    file_path: str
+    line_number: Optional[int] = None
+    title: str
+    description: str
+    recommended_fix: Optional[str] = None
+    timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
+
+
+======================================================================
+FILE: src/devopsmind/database/sqlite.py
+======================================================================
+import sqlite3
+from src.devopsmind.config import settings
+
+def init_db():
+    settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(settings.DB_PATH)
+    cursor = conn.cursor()
+
+    # Analysis Snapshots
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS analysis_runs (
+            run_id TEXT PRIMARY KEY,
+            project_name TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            health_score INTEGER DEFAULT 0,
+            status TEXT NOT NULL
+        )
+    ''')
+
+    # Agent Findings
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS agent_findings (
+            finding_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            agent_name TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            line_number INTEGER,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            recommended_fix TEXT,
+            timestamp TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES analysis_runs(run_id)
+        )
+    ''')
+
+    conn.commit()
+    conn.close()
+
+if __name__ == "__main__":
+    init_db()
+    print(f"Database successfully initialized at {settings.DB_PATH}")
+
+
+======================================================================
+FILE: src/devopsmind/ingestion/file_parser.py
+======================================================================
+import os
+import zipfile
+import pathspec
+from pathlib import Path
+from typing import List, Dict, Any
+
+DEFAULT_EXCLUSIONS = [
+    ".git/", ".venv/", "venv/", "node_modules/", "__pycache__/",
+    "*.pyc", "*.pyo", ".pytest_cache/", ".mypy_cache/", "dist/", "build/"
+]
+
+def load_gitignore_patterns(repo_path: Path) -> pathspec.PathSpec:
+    """Loads .gitignore patterns along with default exclusions."""
+    patterns = list(DEFAULT_EXCLUSIONS)
+    gitignore_file = repo_path / ".gitignore"
+    if gitignore_file.exists():
+        with open(gitignore_file, "r", encoding="utf-8", errors="ignore") as f:
+            patterns.extend(f.readlines())
+    return pathspec.PathSpec.from_lines("gitwildmatch", patterns)
+
+def extract_zip(zip_path: str, extract_to: str) -> Path:
+    """Safely extracts a ZIP archive into a target directory."""
+    target_dir = Path(extract_to)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(target_dir)
+    return target_dir
+
+def scan_repository(repo_path: str) -> List[Dict[str, Any]]:
+    """Scans the repository directory and returns a list of valid source files."""
+    base_path = Path(repo_path).resolve()
+    spec = load_gitignore_patterns(base_path)
+    
+    file_inventory = []
+    
+    for root, dirs, files in os.walk(base_path):
+        rel_root = Path(root).relative_to(base_path)
+        
+        # Prune ignored directories in-place
+        dirs[:] = [d for d in dirs if not spec.match_file(str(rel_root / d) + "/")]
+        
+        for file in files:
+            rel_file_path = str(rel_root / file) if str(rel_root) != "." else file
+            if not spec.match_file(rel_file_path):
+                full_path = base_path / rel_file_path
+                file_inventory.append({
+                    "relative_path": rel_file_path,
+                    "full_path": str(full_path),
+                    "extension": full_path.suffix.lower(),
+                    "size_bytes": full_path.stat().st_size
+                })
+                
+    return file_inventory
+
+
+======================================================================
+FILE: src/devopsmind/preprocessing/ast_parser.py
+======================================================================
+import ast
+from pathlib import Path
+from typing import Dict, Any, List
+
+def parse_python_file(file_path: str) -> Dict[str, Any]:
+    """Parses a Python file using AST to extract imports, classes, functions, and docstrings."""
+    path = Path(file_path)
+    if not path.exists() or path.suffix.lower() != ".py":
+        return {"error": "Invalid or non-Python file"}
+
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        code = f.read()
+
+    try:
+        tree = ast.parse(code, filename=str(path))
+    except SyntaxError as e:
+        return {"error": f"SyntaxError during AST parsing: {e}"}
+
+    imports = []
+    functions = []
+    classes = []
+
+    for node in ast.iter_child_nodes(tree):
+        # Extract Imports
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.append({"name": alias.name, "as": alias.asname})
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            for alias in node.names:
+                imports.append({"from": module, "name": alias.name, "as": alias.asname})
+
+        # Extract Top-level Functions
+        elif isinstance(node, ast.FunctionDef):
+            functions.append({
+                "name": node.name,
+                "line": node.lineno,
+                "args": [arg.arg for arg in node.args.args],
+                "docstring": ast.get_docstring(node)
+            })
+
+        # Extract Classes and Method Metadata
+        elif isinstance(node, ast.ClassDef):
+            class_methods = []
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef):
+                    class_methods.append({
+                        "name": item.name,
+                        "line": item.lineno,
+                        "args": [arg.arg for arg in item.args.args],
+                        "docstring": ast.get_docstring(item)
+                    })
+            classes.append({
+                "name": node.name,
+                "line": node.lineno,
+                "docstring": ast.get_docstring(node),
+                "methods": class_methods
+            })
+
+    return {
+        "file_path": str(path),
+        "imports": imports,
+        "classes": classes,
+        "functions": functions,
+        "line_count": len(code.splitlines())
+    }
+
+
+======================================================================
+FILE: src/devopsmind/agents/code_review_agent.py
+======================================================================
+import subprocess
+import json
+import uuid
+from pathlib import Path
+from typing import List, Dict, Any
+from langchain_ollama import OllamaLLM
+from src.devopsmind.config import settings
+from src.devopsmind.schemas.findings import Finding
+
+def run_ruff_linter(target_path: str) -> List[Dict[str, Any]]:
+    """Runs ruff check in JSON mode over the target path."""
+    try:
+        result = subprocess.run(
+            ["ruff", "check", target_path, "--output-format=json"],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        if result.stdout.strip():
+            return json.loads(result.stdout)
+        return []
+    except Exception as e:
+        print(f"[CodeReviewAgent] Ruff linter execution error: {e}")
+        return []
+
+class CodeReviewAgent:
+    def __init__(self, run_id: str):
+        self.run_id = run_id
+        self.agent_name = "CodeReviewAgent"
+        self.llm = OllamaLLM(
+            base_url=settings.OLLAMA_BASE_URL,
+            model=settings.OLLAMA_MODEL
+        )
+
+    def analyze(self, target_path: str) -> List[Finding]:
+        print(f"[{self.agent_name}] Running Ruff static check on {target_path}...")
+        raw_issues = run_ruff_linter(target_path)
+        print(f"[{self.agent_name}] Detected {len(raw_issues)} static issues.")
+
+        findings: List[Finding] = []
+
+        # Process up to the top 5 issues to keep local LLM execution fast
+        for issue in raw_issues[:5]:
+            file_path = issue.get("filename", "")
+            line_no = issue.get("location", {}).get("row", 1)
+            code = issue.get("code", "QUALITY_ISSUE")
+            message = issue.get("message", "Potential code quality problem detected.")
+
+            # Severity mapping based on Ruff codes
+            severity = "MEDIUM"
+            if code.startswith("E") or code.startswith("F"):  # Syntax Errors / PyFlakes
+                severity = "HIGH"
+            elif code.startswith("I") or code.startswith("D"): # Imports / Docs
+                severity = "LOW"
+
+            # Prompt LLM for explanation and suggested fix
+            prompt = f"""You are a Code Quality and Review Expert.
+Analyze this linter finding:
+- File: {file_path}
+- Line: {line_no}
+- Rule Code: {code}
+- Message: {message}
+
+Provide a concise 2-sentence explanation of why this is a code smell or bug, and supply the corrected Python code snippet.
+"""
+            try:
+                explanation = self.llm.invoke(prompt).strip()
+            except Exception as e:
+                explanation = f"Linter rule violation: {message}. (LLM explanation unavailable: {e})"
+
+            finding = Finding(
+                id=str(uuid.uuid4()),
+                run_id=self.run_id,
+                agent_name=self.agent_name,
+                severity=severity,
+                file_path=file_path,
+                line_number=line_no,
+                title=f"[{code}] {message}",
+                description=explanation,
+                recommended_fix=f"Review line {line_no} for rule violation {code}."
+            )
+            findings.append(finding)
+
+        return findings
+
+
+======================================================================
+FILE: src/devopsmind/agents/security_agent.py
+======================================================================
+import subprocess
+import json
+import uuid
+import re
+from pathlib import Path 
+from typing import List, Dict, Any
+from langchain_ollama import OllamaLLM
+from src.devopsmind.config import settings
+from src.devopsmind.schemas.findings import Finding
+
+def run_bandit_scanner(target_path: str) -> List[Dict[str, Any]]:
+    """Runs Bandit security scanner in JSON mode over the target path."""
+    try:
+        result = subprocess.run(
+            ["bandit", "-r", target_path, "-f", "json"],
+            capture_output=True,
+            text=True,
+            check=False
+        )
+        if result.stdout.strip():
+            data = json.loads(result.stdout)
+            return data.get("results", [])
+        return []
+    except Exception as e:
+        print(f"[SecurityAgent] Bandit scanner execution error: {e}")
+        return []
+
+def scan_for_basic_secrets(target_path: str) -> List[Dict[str, Any]]:
+    """Simple regex secret scanner fallback if Gitleaks is not installed."""
+    secret_patterns = {
+        "AWS API Key": r"AKIA[0-9A-Z]{16}",
+        "Generic Secret/Token": r"(?i)(api_key|secret_key|password|token)\s*=\s*['\"][A-Za-z0-9_\-]{8,}['\"]",
+    }
+    findings = []
+    path = Path(target_path)
+    if not path.exists():
+        return findings
+
+    for py_file in path.glob("**/*.py"):
+        try:
+            with open(py_file, "r", encoding="utf-8", errors="ignore") as f:
+                for line_no, line in enumerate(f, start=1):
+                    for label, pattern in secret_patterns.items():
+                        if re.search(pattern, line):
+                            # Redact line snippet
+                            redacted_line = re.sub(r"=['\"].*?['\"]", "='[REDACTED]'", line.strip())
+                            findings.append({
+                                "filename": str(py_file),
+                                "line_number": line_no,
+                                "issue_text": f"Potential {label} detected",
+                                "code_snippet": redacted_line,
+                                "severity": "CRITICAL"
+                            })
+        except Exception:
+            continue
+    return findings
+
+class SecurityAgent:
+    def __init__(self, run_id: str):
+        self.run_id = run_id
+        self.agent_name = "SecurityAgent"
+        self.llm = OllamaLLM(
+            base_url=settings.OLLAMA_BASE_URL,
+            model=settings.OLLAMA_MODEL
+        )
+
+    def analyze(self, target_path: str) -> List[Finding]:
+        print(f"[{self.agent_name}] Running Bandit SAST scan on {target_path}...")
+        bandit_results = run_bandit_scanner(target_path)
+        secret_results = scan_for_basic_secrets(target_path)
+
+        print(f"[{self.agent_name}] Detected {len(bandit_results)} SAST issues and {len(secret_results)} potential secrets.")
+
+        findings: List[Finding] = []
+
+        # 1. Process Secret Detections
+        for secret in secret_results:
+            finding = Finding(
+                id=str(uuid.uuid4()),
+                run_id=self.run_id,
+                agent_name=self.agent_name,
+                severity="CRITICAL",
+                file_path=secret["filename"],
+                line_number=secret["line_number"],
+                title=f"[SECRET_LEAK] {secret['issue_text']}",
+                description=f"Hardcoded credential risk: {secret['code_snippet']}. Remove credentials and store in environment variables.",
+                recommended_fix="Use environment variables or a secrets vault instead of hardcoding sensitive strings."
+            )
+            findings.append(finding)
+
+        # 2. Process Bandit SAST Findings (up to top 5)
+        for issue in bandit_results[:5]:
+            file_path = issue.get("filename", "")
+            line_no = issue.get("line_number", 1)
+            test_id = issue.get("test_id", "SECURITY_ISSUE")
+            severity_raw = issue.get("issue_severity", "MEDIUM").upper()
+            issue_text = issue.get("issue_text", "Potential security flaw.")
+
+            severity = "HIGH" if severity_raw == "HIGH" else "MEDIUM"
+
+            prompt = f"""You are an Application Security Expert.
+Analyze this Bandit SAST finding:
+- File: {file_path}
+- Line: {line_no}
+- Vulnerability ID: {test_id}
+- Description: {issue_text}
+
+Explain the risk in 2 simple sentences and provide a secure coding recommendation.
+"""
+            try:
+                explanation = self.llm.invoke(prompt).strip()
+            except Exception as e:
+                explanation = f"Security risk: {issue_text}. (LLM explanation unavailable: {e})"
+
+            finding = Finding(
+                id=str(uuid.uuid4()),
+                run_id=self.run_id,
+                agent_name=self.agent_name,
+                severity=severity,
+                file_path=file_path,
+                line_number=line_no,
+                title=f"[{test_id}] {issue_text}",
+                description=explanation,
+                recommended_fix=f"Review security flaw at line {line_no} and apply sanitized input or secure patterns."
+            )
+            findings.append(finding)
+
+        return findings
+
+
+======================================================================
+FILE: src/devopsmind/agents/architecture_agent.py
+======================================================================
+import ast
+import uuid
+import networkx as nx
+from pathlib import Path
+from typing import List, Dict, Any, Tuple
+from langchain_ollama import OllamaLLM
+from src.devopsmind.config import settings
+from src.devopsmind.schemas.findings import Finding
+
+class ArchitectureAgent:
+    def __init__(self, run_id: str):
+        self.run_id = run_id
+        self.agent_name = "ArchitectureAgent"
+        self.llm = OllamaLLM(
+            base_url=settings.OLLAMA_BASE_URL,
+            model=settings.OLLAMA_MODEL
+        )
+
+    def build_dependency_graph(self, target_path: str) -> Tuple[nx.DiGraph, List[Dict[str, Any]]]:
+        """Scans Python files and constructs a directed module dependency graph."""
+        graph = nx.DiGraph()
+        base_dir = Path(target_path).resolve()
+        py_files = list(base_dir.glob("**/*.py"))
+
+        module_stats = []
+
+        for py_file in py_files:
+            rel_module = py_file.relative_to(base_dir).with_suffix("").as_posix().replace("/", ".")
+            graph.add_node(rel_module)
+
+            try:
+                with open(py_file, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                    tree = ast.parse(content, filename=str(py_file))
+                    line_count = len(content.splitlines())
+
+                imports_count = 0
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.Import, ast.ImportFrom)):
+                        imports_count += 1
+                        if isinstance(node, ast.ImportFrom) and node.module:
+                            graph.add_edge(rel_module, node.module)
+                        elif isinstance(node, ast.Import):
+                            for alias in node.names:
+                                graph.add_edge(rel_module, alias.name)
+
+                module_stats.append({
+                    "module": rel_module,
+                    "file_path": str(py_file),
+                    "line_count": line_count,
+                    "imports_count": imports_count
+                })
+
+            except Exception as e:
+                print(f"[{self.agent_name}] Warning: Could not parse {py_file} for AST: {e}")
+
+        return graph, module_stats
+
+    def analyze(self, target_path: str) -> Tuple[List[Finding], Dict[str, Any]]:
+        print(f"[{self.agent_name}] Extracting dependency graph for {target_path}...")
+        graph, module_stats = self.build_dependency_graph(target_path)
+
+        findings: List[Finding] = []
+
+        # 1. Detect Circular Dependencies using NetworkX
+        cycles = list(nx.simple_cycles(graph))
+        print(f"[{self.agent_name}] Total modules: {len(graph.nodes)}, Circular cycles detected: {len(cycles)}")
+
+        for cycle in cycles:
+            cycle_str = " -> ".join(cycle) + f" -> {cycle[0]}"
+            prompt = f"Explain why circular module dependencies like '{cycle_str}' degrade software maintainability in 2 sentences."
+            try:
+                explanation = self.llm.invoke(prompt).strip()
+            except Exception:
+                explanation = "Circular import detected. This can cause runtime import errors and high coupling."
+
+            finding = Finding(
+                id=str(uuid.uuid4()),
+                run_id=self.run_id,
+                agent_name=self.agent_name,
+                severity="HIGH",
+                file_path=cycle[0],
+                line_number=1,
+                title="[CIRCULAR_DEPENDENCY] Module import loop detected",
+                description=f"Circular cycle: {cycle_str}. {explanation}",
+                recommended_fix="Refactor shared components into a common utility module to break the cycle."
+            )
+            findings.append(finding)
+
+        # 2. Detect Overly Complex / Large Files (>150 lines)
+        for stat in module_stats:
+            if stat["line_count"] > 150:
+                finding = Finding(
+                    id=str(uuid.uuid4()),
+                    run_id=self.run_id,
+                    agent_name=self.agent_name,
+                    severity="MEDIUM",
+                    file_path=stat["file_path"],
+                    line_number=1,
+                    title="[HIGH_COMPLEXITY] Large file detected",
+                    description=f"Module '{stat['module']}' contains {stat['line_count']} lines. Consider splitting into sub-modules.",
+                    recommended_fix="Decompose functions and classes into separate, single-responsibility files."
+                )
+                findings.append(finding)
+
+        graph_summary = {
+            "node_count": len(graph.nodes),
+            "edge_count": len(graph.edges),
+            "cycles_count": len(cycles)
+        }
+
+        return findings, graph_summary
+
+
+======================================================================
+FILE: src/devopsmind/agents/test_gen_agent.py
+======================================================================
+import os
+import ast
+import uuid
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import List, Dict, Any
+from langchain_ollama import OllamaLLM
+from src.devopsmind.config import settings
+from src.devopsmind.schemas.findings import Finding
+
+class TestGenerationAgent:
+    def __init__(self, run_id: str):
+        self.run_id = run_id
+        self.agent_name = "TestGenerationAgent"
+        self.llm = OllamaLLM(
+            base_url=settings.OLLAMA_BASE_URL,
+            model=settings.OLLAMA_MODEL
+        )
+        self.sandbox_dir = settings.BASE_DIR / "data" / "sandbox_tests"
+        self.sandbox_dir.mkdir(parents=True, exist_ok=True)
+
+    def extract_target_functions(self, target_path: str) -> List[Dict[str, Any]]:
+        """Scans Python files and extracts top-level functions for test generation."""
+        functions = []
+        base_dir = Path(target_path).resolve()
+        
+        for py_file in base_dir.glob("**/*.py"):
+            # Skip test files themselves
+            if "test_" in py_file.name:
+                continue
+            try:
+                with open(py_file, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read()
+                    tree = ast.parse(content, filename=str(py_file))
+                
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.FunctionDef):
+                        # Extract source code snippet of the function
+                        lines = content.splitlines()
+                        func_code = "\n".join(lines[node.lineno - 1 : node.end_lineno]) if hasattr(node, 'end_lineno') else f"def {node.name}(): pass"
+                        
+                        functions.append({
+                            "name": node.name,
+                            "file_path": str(py_file),
+                            "code_snippet": func_code
+                        })
+            except Exception as e:
+                print(f"[{self.agent_name}] Error extracting functions from {py_file}: {e}")
+                
+        return functions[:3]  # Limit to 3 functions per run to keep execution fast
+
+    def generate_and_execute_tests(self, target_path: str) -> List[Finding]:
+        print(f"[{self.agent_name}] Inspecting functions for automated test generation...")
+        target_funcs = self.extract_target_functions(target_path)
+        print(f"[{self.agent_name}] Selected {len(target_funcs)} functions for testing.")
+
+        findings: List[Finding] = []
+
+        for func in target_funcs:
+            func_name = func["name"]
+            func_code = func["code_snippet"]
+            file_path = func["file_path"]
+
+            print(f"[{self.agent_name}] Generating PyTest cases for function '{func_name}'...")
+
+            prompt = f"""You are an Expert QA and Test Automation Engineer.
+Write a complete, executable PyTest test file in Python for the following function.
+Return ONLY valid Python code block using ```python ... ``` without extra conversational text.
+
+Target Function Code:
+{func_code}
+"""
+            try:
+                response = self.llm.invoke(prompt).strip()
+                # Extract python code block
+                if "```python" in response:
+                    test_code = response.split("```python")[1].split("```")[0].strip()
+                elif "```" in response:
+                    test_code = response.split("```")[1].split("```")[0].strip()
+                else:
+                    test_code = response
+
+                # Save generated test into sandbox
+                test_file_name = f"test_{func_name}_{uuid.uuid4().hex[:6]}.py"
+                test_file_path = self.sandbox_dir / test_file_name
+                with open(test_file_path, "w", encoding="utf-8") as tf:
+                    tf.write(test_code)
+
+                # Execute pytest in isolated sandbox with timeout limit
+                print(f"[{self.agent_name}] Executing generated test: {test_file_name}")
+                result = subprocess.run(
+                    ["pytest", str(test_file_path), "--no-header", "-v"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False
+                )
+
+                passed = result.returncode == 0
+                output_log = result.stdout + result.stderr
+
+                if not passed:
+                    finding = Finding(
+                        id=str(uuid.uuid4()),
+                        run_id=self.run_id,
+                        agent_name=self.agent_name,
+                        severity="MEDIUM",
+                        file_path=file_path,
+                        line_number=1,
+                        title=f"[TEST_FAILURE] Generated test failed for '{func_name}'",
+                        description=f"Automated test execution failed.\nPyTest Output:\n{output_log[:500]}",
+                        recommended_fix="Review function implementation or adjust boundary assertions in generated test."
+                    )
+                    findings.append(finding)
+                else:
+                    print(f"[{self.agent_name}] Test passed successfully for '{func_name}'!")
+
+            except subprocess.TimeoutExpired:
+                print(f"[{self.agent_name}] Test execution timed out for {func_name}.")
+            except Exception as e:
+                print(f"[{self.agent_name}] Error during test generation/execution: {e}")
+
+        return findings
+
+
+======================================================================
+FILE: src/devopsmind/agents/log_agent.py
+======================================================================
+import re
+import uuid
+from pathlib import Path
+from typing import List, Dict, Any
+from langchain_ollama import OllamaLLM
+from src.devopsmind.config import settings
+from src.devopsmind.schemas.findings import Finding
+
+class LogAnalysisAgent:
+    def __init__(self, run_id: str):
+        self.run_id = run_id
+        self.agent_name = "LogAnalysisAgent"
+        self.llm = OllamaLLM(
+            base_url=settings.OLLAMA_BASE_URL,
+            model=settings.OLLAMA_MODEL
+        )
+
+    def parse_log_file(self, log_file_path: str) -> List[Dict[str, Any]]:
+        """Parses raw build, test, or deployment logs for stack traces and errors."""
+        path = Path(log_file_path)
+        if not path.exists():
+            return []
+
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+
+        errors = []
+        # Match common Python traceback or error patterns
+        traceback_pattern = re.compile(r'(Traceback \(most recent call last\):[\s\S]*?\n\w+Error: .+)', re.MULTILINE)
+        matches = traceback_pattern.findall(content)
+
+        if matches:
+            for match in matches:
+                errors.append({
+                    "type": "Python Traceback",
+                    "snippet": match.strip()[:1000],
+                    "line_number": 1
+                })
+        else:
+            # Fallback: scan for general error / failed lines
+            for line_no, line in enumerate(content.splitlines(), start=1):
+                if any(keyword in line.lower() for keyword in ["error", "fail", "exception", "fatal"]):
+                    errors.append({
+                        "type": "Log Error Line",
+                        "snippet": line.strip(),
+                        "line_number": line_no
+                    })
+
+        return errors[:5]  # Limit to top 5 errors
+
+    def analyze(self, log_file_path: str) -> List[Finding]:
+        print(f"[{self.agent_name}] Analyzing log file: {log_file_path}...")
+        raw_errors = self.parse_log_file(log_file_path)
+        print(f"[{self.agent_name}] Detected {len(raw_errors)} error signatures in logs.")
+
+        findings: List[Finding] = []
+
+        for err in raw_errors:
+            snippet = err["snippet"]
+            line_no = err["line_number"]
+
+            prompt = f"""You are a DevOps Incident Response and Log Troubleshooting Expert.
+Analyze this error trace extracted from build/test logs:
+{snippet}
+
+Provide a 2-sentence root cause explanation and a recommended operational fix.
+"""
+            try:
+                explanation = self.llm.invoke(prompt).strip()
+            except Exception as e:
+                explanation = f"Log anomaly detected: {err['type']}. (LLM diagnosis unavailable: {e})"
+
+            finding = Finding(
+                id=str(uuid.uuid4()),
+                run_id=self.run_id,
+                agent_name=self.agent_name,
+                severity="HIGH",
+                file_path=log_file_path,
+                line_number=line_no,
+                title=f"[LOG_ERROR] {err['type']} detected",
+                description=explanation,
+                recommended_fix="Review build configuration or correct failing test/runtime parameters."
+            )
+            findings.append(finding)
+
+        return findings
